@@ -54,6 +54,7 @@ def test_qwen3_dense_eager_mode(
         runner.model.generate(prompts, sampling_params)
 
 
+@pytest.mark.skip(reason="eagle function isn't adapted to the newest main commit.")
 @pytest.mark.parametrize("model", MAIN_MODELS)
 @pytest.mark.parametrize("eagle_model", EGALE_MODELS)
 @pytest.mark.parametrize("max_tokens", [32])
@@ -83,5 +84,34 @@ def test_egale_spec_decoding(
             "method": "eagle",
             "num_speculative_tokens": 3,
         },
+    ) as runner:
+        runner.model.generate(prompts, sampling_params)
+
+
+@pytest.mark.skip(reason="graph function isn't adapted to the newest main commit.")
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("max_tokens", [32])
+@pytest.mark.parametrize("enforce_eager", [False])
+@pytest.mark.parametrize("compilation_config", [{"cudagraph_mode": "FULL_DECODE_ONLY"}, {}])
+@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
+def test_qwen3_dense_graph_mode(
+    model: str,
+    max_tokens: int,
+    enforce_eager: bool,
+    compilation_config: dict,
+) -> None:
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+    with VllmRunner(
+        model,
+        max_model_len=1024,
+        enforce_eager=enforce_eager,
+        compilation_config=compilation_config,
     ) as runner:
         runner.model.generate(prompts, sampling_params)

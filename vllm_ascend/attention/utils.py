@@ -113,8 +113,18 @@ class AscendPrefillContextParallelMetadata:
     # when entering from linear-attention to attention
     pcp_enter_fa_restore_idx: torch.Tensor = None
 
+    # scatter the full sequence across all pcp ranks
+    # when exiting from attention to linear-attention
+    pcp_exit_fa_scatter_idx: torch.Tensor = None
+
     # the number of tokens padded in linear-attn per rank
     pcp_padded_tokens_fla: int = 0
+
+    # the max number of unpadded tokens in all ranks
+    max_num_tokens_across_pcp: int = 0
+
+    # the number of scheduled tokens on the current rank before padding
+    total_num_scheduled_tokens: int = 0
 
 
 @dataclass
