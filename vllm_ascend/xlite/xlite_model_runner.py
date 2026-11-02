@@ -166,7 +166,16 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
         super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
-        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches, check_is_contiguous=False)
+        # V4 CXA extracts each KV-cache plane from the runnable's layer modules (see
+        # `DeepseekV4XliteModel.extract_kv_cache`), so the flattened list's contiguity is irrelevant to it.
+        # vllm-ascend allocates several V4 planes (state/indexer_state/indexer_k/indexer_scale) with a
+        # dim-0 row pitch (page_size_padded; stride[0] > the row-major stride), so `is_contiguous()`
+        # returns False on them despite the layout being intentional and correct — skip the strict
+        # contiguity check for V4.
+        check_contiguous = getattr(self.runner_model.adapter_xlite_model, "_flatten_kv_cache_contiguous_check", True)
+        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(
+            self.kv_caches, check_is_contiguous=check_contiguous
+        )
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
         self.runner_model.register_kv_caches(kv_caches)
 

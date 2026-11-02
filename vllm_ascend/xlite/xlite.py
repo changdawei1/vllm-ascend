@@ -33,7 +33,18 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import (
+    AttnCxA,
+    AttnDSA,
+    AttnMeta,
+    AttnMetaV2,
+    AttnMHA,
+    AttnMLA,
+    Runtime,
+    ScoringFuncSigmoid,
+    ScoringFuncSoftmax,
+    ScoringFuncSqrtsoftplus,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -676,6 +687,504 @@ class DeepseekV32XliteModel(DeepseekV3XliteModel):
         return [(mla_cache[0], mla_cache[1], i_cache) for mla_cache, i_cache in zip(mla_caches, index_caches)]
 
 
+class DeepseekV4XliteModel(DeepseekV3XliteModel):
+    """xlite adapter for DeepSeek-V4 with CXA (compress-index-sparse) attention.
+
+    V4 uses a distinct weight set (per-layer compressor & indexer, multi-stage
+    hyper-connections) and a 5-tuple KV cache, so neither V3's MLA weights nor
+    V3.2's DSA index weights apply. CXA runs only on the V2 device-tensor forward.
+    """
+
+    from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata
+
+    _attn_metadata_type = AscendDSAMetadata  # type: ignore[assignment]
+    _supported_architectures = ["DeepseekV4ForCausalLM"]
+    # V4 CXA only has a V2 device-tensor forward path.
+    _uses_v2: bool = True
+    _flatten_kv_cache_contiguous_check: bool = False
+    _cxa_block_sizes = [8, 128, 128, 32, 128]
+
+    def __init__(self, npu_runner: XliteModelRunner, vllm_config: VllmConfig) -> None:
+        try:
+            from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+            _bs = vllm_config.cache_config.block_size
+            _planes = DSV4_BLOCK_SIZES[_bs][0]  # [mla, swa, c4_state, c128_state]
+            self._cxa_block_sizes = [
+                _planes[2],  # indexer_state = c4_state
+                _planes[0],  # indexer_k    = mla
+                _planes[0],  # compress_kv  = mla
+                _planes[3],  # state        = c128_state
+                _planes[1],  # swa_kv       = swa
+            ]
+        except Exception:
+            pass  # fall back to the hardcoded class attr if the table is unavailable
+        super().__init__(npu_runner, vllm_config)
+
+    def _build_model_config(self) -> None:
+        hf_config = self.hf_text_config
+        if getattr(hf_config, "intermediate_size", None) is None:
+            hf_config.intermediate_size = hf_config.moe_intermediate_size
+        super(DeepseekV3XliteModel, self)._build_model_config()
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        xlite_config.attn_type = AttnCxA
+        xlite_config.n_kv_heads = 1
+        xlite_config.head_dim = hf_config.head_dim
+        xlite_config.rope_head_dim = hf_config.qk_rope_head_dim
+        xlite_config.nope_head_dim = hf_config.head_dim - hf_config.qk_rope_head_dim
+        xlite_config.v_head_dim = hf_config.head_dim  # v4: v_head_dim == head_dim
+        xlite_config.q_lora_rank = hf_config.q_lora_rank
+        xlite_config.kv_lora_rank = hf_config.head_dim  # v4: wkv projects dim -> head_dim
+        xlite_config.softmax_scale = hf_config.head_dim**-0.5
+
+        # V4 MoE: sqrtsoftplus scoring; hash routing for early layers.
+        xlite_config.scoring_func = ScoringFuncSqrtsoftplus
+        xlite_config.norm_topk_prob = True
+        xlite_config.n_hash_layers = hf_config.num_hash_layers
+
+        # CXA block sizes + per-layer compress ratios.
+        xlite_config.block_sizes = list(self._cxa_block_sizes)
+        xlite_config.compress_ratios = list(hf_config.compress_ratios)
+        # Indexer lives on compress_ratio==4 layers. HF compress_ratios may carry a trailing
+        # MTP-draft entry; trim to the decoder layer count.
+        xlite_config.index_c8_mask = [r == 4 for r in hf_config.compress_ratios][: xlite_config.n_layers]
+
+        # V4-specific scalar fields.
+        xlite_config.o_groups = hf_config.o_groups
+        xlite_config.o_lora_rank = hf_config.o_lora_rank
+        xlite_config.window_size = hf_config.sliding_window
+        xlite_config.compress_rope_theta = hf_config.compress_rope_theta
+        xlite_config.index_head_dim = hf_config.index_head_dim
+        xlite_config.index_n_heads = hf_config.index_n_heads
+        xlite_config.index_topk = hf_config.index_topk
+        rope_params: dict[str, Any] = getattr(hf_config, "rope_parameters", {}) or getattr(
+            hf_config, "rope_scaling", {}
+        )
+        xlite_config.original_seq_len = rope_params.get(
+            "original_max_position_embeddings", getattr(hf_config, "max_position_embeddings", 0)
+        )
+        xlite_config.rope_factor = rope_params.get("factor", 1.0)
+        xlite_config.beta_fast = rope_params.get("beta_fast", getattr(hf_config, "beta_fast", 32))
+        xlite_config.beta_slow = rope_params.get("beta_slow", getattr(hf_config, "beta_slow", 1))
+        xlite_config.hc_mult = hf_config.hc_mult
+        xlite_config.hc_sinkhorn_iters = hf_config.hc_sinkhorn_iters
+        xlite_config.hc_eps = hf_config.hc_eps
+        xlite_config.swiglu_limit = hf_config.swiglu_limit
+
+    def _build_model(self) -> None:
+        # V4 CXA shares neither V3's MLA weights nor Standard's MHA/dense-MLP weights.
+        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        layers, model_prefix = self._get_layers_and_model_prefix()
+        compress_ratios = list(xlite_config.compress_ratios)
+        # Trim a possible trailing MTP-draft entry so the list matches the decoder layers.
+        compress_ratios = compress_ratios[: len(layers)]
+        compress_mask = [r > 0 for r in compress_ratios]  # layers with a compressor
+        indexer_mask = [r == 4 for r in compress_ratios]  # layers with an indexer
+
+        # Norm kernels read weights as bf16 (matching native RMSNorm's weight.to(dtype));
+        # fp32 would be byte-reinterpreted and corrupt, so cast every norm weight to bf16.
+        def _bf16(w: torch.Tensor) -> torch.Tensor:
+            return w.to(torch.bfloat16).contiguous()
+
+        xlite_model.embed = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.embed_tokens.weight", raises=True)
+        xlite_model.norm = _bf16(get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True))
+        if self.vllm_config.model_config.hf_config.tie_word_embeddings:
+            xlite_model.head = xlite_model.embed
+        else:
+            xlite_model.head = get_dotted_attr(self.npu_runnable, f"{model_prefix}lm_head.weight", raises=True)
+        xlite_model.attn_norm = get_layer_weights(layers, "input_layernorm.weight", post_processor=_bf16)
+        xlite_model.mlp_norm = get_layer_weights(layers, "post_attention_layernorm.weight", post_processor=_bf16)
+
+        # CxA attention weights. wq_a/wkv/wq_b are W8A8_DYNAMIC (int8 + weight_scale); wo_a/wo_b
+        # are FLOAT (bf16) read directly via get_layer_weights.
+        self.init_matmul_weights(layers, "attn_wq_a", "self_attn.wq_a")
+        self.init_matmul_weights(layers, "attn_wkv", "self_attn.wkv")
+        self.init_matmul_weights(layers, "mla_q_b", "self_attn.wq_b")  # wq_b reuses mla_q_b field
+        self.init_matmul_weights(layers, "idx_wq_b", "self_attn.indexer.wq_b", mask=indexer_mask)
+
+        # vllm stores wo_a grouped as [1, in, out] for its batched o-proj; xlite wants 2D
+        # [o_lora_rank, hidden], so squeeze the group dim and transpose. wo_b is already 2D.
+        def _wo_a_view(w: torch.Tensor) -> torch.Tensor:
+            if w.ndim == 3:
+                w = w.squeeze(0)  # [in, out]
+            return w.t().contiguous() if w.shape[0] != self.xlite_config.o_lora_rank else w
+
+        xlite_model.attn_wo_a = get_layer_weights(layers, "self_attn.wo_a.weight", post_processor=_wo_a_view)
+        xlite_model.attn_wo_b = get_layer_weights(layers, "self_attn.wo_b.weight")
+        xlite_model.attn_sink = get_layer_weights(layers, "self_attn.attn_sink")
+        xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_norm.weight", post_processor=_bf16)
+        xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_norm.weight", post_processor=_bf16)
+        xlite_model.attn_out = []  # v4 has no separate attn output projection
+
+        # Compressor (exists iff compress_ratio > 0): ape (fp32 param), wkv/wgate (fp32),
+        # norm (bf16 to match the kernel's bf16 weight read).
+        xlite_model.comp_ape = get_layer_weights(layers, "self_attn.compressor.ape", mask=compress_mask)
+        # comp_w_kv/comp_w_gate MUST be fp32: the compressor GEMM output is fp32, so a bf16
+        # weight would mismatch the output dtype and throw.
+        xlite_model.comp_w_kv = get_layer_weights(
+            layers,
+            "self_attn.compressor.wkv.weight",
+            mask=compress_mask,
+            post_processor=lambda w: w.to(torch.float32).contiguous(),
+        )
+        xlite_model.comp_w_gate = get_layer_weights(
+            layers,
+            "self_attn.compressor.wgate.weight",
+            mask=compress_mask,
+            post_processor=lambda w: w.to(torch.float32).contiguous(),
+        )
+        xlite_model.comp_norm = get_layer_weights(
+            layers,
+            "self_attn.compressor.norm.weight",
+            mask=compress_mask,
+            post_processor=lambda w: w.to(torch.bfloat16).contiguous(),
+        )
+
+        # Indexer (exists iff compress_ratio == 4).
+        xlite_model.idx_weights_proj = get_layer_weights(
+            layers, "self_attn.indexer.weights_proj.weight", mask=indexer_mask
+        )
+        xlite_model.idx_comp_ape = get_layer_weights(layers, "self_attn.indexer.compressor.ape", mask=indexer_mask)
+        # Same fp32 requirement as comp_w_kv/w_gate (indexer GEMM output is hardcoded fp32).
+        xlite_model.idx_comp_w_kv = get_layer_weights(
+            layers,
+            "self_attn.indexer.compressor.wkv.weight",
+            mask=indexer_mask,
+            post_processor=lambda w: w.to(torch.float32).contiguous(),
+        )
+        xlite_model.idx_comp_w_gate = get_layer_weights(
+            layers,
+            "self_attn.indexer.compressor.wgate.weight",
+            mask=indexer_mask,
+            post_processor=lambda w: w.to(torch.float32).contiguous(),
+        )
+        xlite_model.idx_comp_norm = get_layer_weights(
+            layers,
+            "self_attn.indexer.compressor.norm.weight",
+            mask=indexer_mask,
+            post_processor=lambda w: w.to(torch.bfloat16).contiguous(),
+        )
+
+        # Multi-stage Hyper-Connections (per-layer direct params on the decoder layer).
+        for attr in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale"):
+            setattr(xlite_model, attr, get_layer_weights(layers, attr))
+        # Transformer-level MHC head (direct params on the model).
+        xlite_model.hc_head_fn = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.hc_head_fn", raises=True)
+        xlite_model.hc_head_base = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.hc_head_base", raises=True)
+        xlite_model.hc_head_scale = get_dotted_attr(
+            self.npu_runnable, f"{model_prefix}model.hc_head_scale", raises=True
+        )
+
+        # MoE: gate (FLOAT), gate_bias (e_score_correction_bias, non-hash layers only),
+        # tid2eid (hash layers only), shared + routed experts (W8A8_DYNAMIC).
+        mlp_prefix = self._decoder_layer_mlp_module
+        xlite_model.gate = get_layer_weights(layers, f"{mlp_prefix}.gate.weight")
+        xlite_config.gate_captured = self.is_tensor_nz(xlite_model.gate[0]) if xlite_model.gate else False
+        # gate_bias: fp32 for topk layers, empty tensor for hash layers (which use tid2eid).
+        # Keep the list n_layers-long so runtime can index by absolute layer id.
+        xlite_model.gate_bias = [
+            (
+                b.to(torch.float32)
+                if (b := get_dotted_attr(layer, f"{mlp_prefix}.gate.e_score_correction_bias")) is not None
+                else torch.empty(0, dtype=torch.float32)
+            )
+            for layer in layers
+        ]
+        # tid2eid is hash-layers only; vllm sets it None on topk layers, so get_layer_weights
+        # (which skips None) yields exactly the hash ones.
+        xlite_model.tid2eid = [t for t in get_layer_weights(layers, f"{mlp_prefix}.gate.tid2eid") if t.numel() > 0]
+        self.init_matmul_weights(layers, "se_up_gate", f"{mlp_prefix}.shared_experts.gate_up_proj")
+        self.init_matmul_weights(layers, "se_down", f"{mlp_prefix}.shared_experts.down_proj")
+
+        re_prefix = f"{mlp_prefix}.experts.routed_experts"
+        re_kwargs: WeightGetterConfig = {"secondary_flattening": f"{re_prefix}.local_num_experts"}
+        xlite_model.re_up_gate = get_layer_weights(layers, f"{re_prefix}.w13_weight", **re_kwargs)
+        xlite_model.re_down = get_layer_weights(layers, f"{re_prefix}.w2_weight", **re_kwargs)
+        xlite_config.experts_weight_nz = bool(xlite_model.re_up_gate) and self.is_tensor_nz(xlite_model.re_up_gate[0])
+        xlite_config.experts_weight_transpose = True
+        if self.quantization:
+            re_kwargs["post_processor"] = self._transform_deq_scale
+            xlite_model.re_up_gate_deq_scale = get_layer_weights(layers, f"{re_prefix}.w13_weight_scale", **re_kwargs)
+            xlite_model.re_down_deq_scale = get_layer_weights(layers, f"{re_prefix}.w2_weight_scale", **re_kwargs)
+            xlite_config.quant_attn_weight_nz = bool(xlite_model.attn_wkv) and self.is_tensor_nz(
+                xlite_model.attn_wkv[0]
+            )
+            xlite_config.quant_attn_weight_transpose = True
+
+    # ----- RoPE: per-layer complex64 with compress/non-compress YaRN distinction -----
+
+    @staticmethod
+    def _yarn_freqs_cis(
+        dim: int,
+        end: int,
+        original_seq_len: int,
+        base: float,
+        factor: float,
+        beta_fast: float,
+        beta_slow: float,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Precompute YaRN-scaled complex64 freqs_cis for RoPE."""
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if end > original_seq_len and original_seq_len > 0:
+
+            def find_correction_dim(num_rotations):
+                return dim * math.log(original_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+            low = max(math.floor(find_correction_dim(beta_fast)), 0)
+            high = min(math.ceil(find_correction_dim(beta_slow)), dim // 2 - 1)
+            if low == high:
+                high += 0.001
+            ramp = torch.clamp((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1)
+            smooth = 1 - ramp
+            inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
+        t = torch.arange(end, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        return torch.polar(torch.ones_like(freqs), freqs).to(device=device, dtype=torch.complex64)
+
+    def _precompute_rope_cache(self) -> list[torch.Tensor]:
+        """Per-layer complex64 freqs_cis list.
+
+        Compress layers (ratio>1) use ``compress_rope_theta`` with YaRN enabled; non-compress
+        layers use ``rope_theta`` with YaRN disabled.
+        """
+        cfg = self.xlite_config
+        dim = cfg.rope_head_dim
+        max_seq_len = cfg.max_seq_len
+        compress_ratios = list(cfg.compress_ratios)
+        freqs: list[torch.Tensor] = []
+        for ratio in compress_ratios:
+            if ratio > 1:
+                base = cfg.compress_rope_theta
+                osl = cfg.original_seq_len
+            else:
+                base = cfg.rope_theta
+                osl = 0
+            freqs.append(
+                self._yarn_freqs_cis(
+                    dim, max_seq_len, osl, base, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow, self.device
+                )
+            )
+        return freqs
+
+    # ----- KV cache: vllm per-plane pools -> xlite CXA tuple -----
+
+    @staticmethod
+    def _unwrap_cache(kv_cache: Any) -> Any:
+        """Strip single-element list/tuple wrappers."""
+        while isinstance(kv_cache, (list, tuple)) and len(kv_cache) == 1:
+            kv_cache = kv_cache[0]
+        return kv_cache
+
+    def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
+        """Build the per-layer CXA tuple
+        ``(indexer_state, indexer_k, compress_kv, state, swa_kv[, indexer_k_scale])``.
+        """
+        layers, _ = self._get_layers_and_model_prefix()
+        compress_ratios = list(self.xlite_config.compress_ratios)
+        n_layers = self.xlite_config.n_layers
+        out: list[tuple[torch.Tensor, ...]] = []
+        for i, layer in enumerate(layers[:n_layers]):
+            ratio = compress_ratios[i] if i < len(compress_ratios) else 0
+            swa = self._unwrap_cache(layer.self_attn.dsa_attn.swa_cache_layer.kv_cache)
+            if ratio > 1:
+                compress = self._unwrap_cache(layer.self_attn.dsa_attn.dsa_attn.kv_cache)
+                state = self._unwrap_cache(layer.self_attn.compressor.state_cache.kv_cache)
+            else:
+                compress = torch.empty(0, dtype=torch.bfloat16, device=self.device)
+                state = torch.empty(0, dtype=torch.bfloat16, device=self.device)
+            indexer_scale: torch.Tensor | None = None
+            if ratio == 4:
+                indexer_state = self._unwrap_cache(layer.self_attn.indexer.compressor.state_cache.kv_cache)
+                indexer_k, indexer_scale = self._unwrap_cache(layer.self_attn.indexer.k_cache.kv_cache)
+            else:
+                indexer_state = torch.empty(0, dtype=torch.bfloat16, device=self.device)
+                indexer_k = torch.empty(0, dtype=torch.bfloat16, device=self.device)
+            if indexer_scale is not None:
+                out.append((indexer_state, indexer_k, compress, state, swa, indexer_scale))
+            else:
+                out.append((indexer_state, indexer_k, compress, state, swa))
+        return out
+
+    # ----- AttnMetaV2: translate vllm DSA metadata -> xlite device-tensor metadata -----
+
+    def _build_attn_meta_v2(self, attn_metadata: dict, positions: torch.Tensor, num_tokens: int) -> AttnMetaV2:
+        """Build an :class:`AttnMetaV2` from vllm's flat DSA metadata dict.
+
+        Sources the 5 planes (compress/swa/state/indexer/indexer_state) from the first
+        ``compress_ratio==4`` layer; its row doubles as the flat default. Slot mapping per plane:
+        * idx0 indexer_state, idx3 state: per-token absolute position (write path).
+        * idx1 indexer_k: per-block physical slot from the indexer block table; its length
+          sets nTotalBlocks.
+        * idx2 compress_kv: per-block physical slot from this row's compress block table —
+          the compressor write path; numel must equal the derived positions count.
+        * idx4 swa_kv: vllm's per-token slot mapping.
+        """
+        compress_ratios = list(self.xlite_config.compress_ratios)
+        c4 = next((i for i, r in enumerate(compress_ratios) if r == 4), None)
+        if c4 is None:
+            raise RuntimeError("xlite V4: no compress_ratio==4 layer to source CXA metadata from")
+        prefix = f"model.layers.{c4}.self_attn"
+        plane_keys = {
+            "compress": f"{prefix}.attn",
+            "swa": f"{prefix}.swa_cache",
+            "state": f"{prefix}.compressor.state_cache",
+            "indexer": f"{prefix}.indexer.k_cache",
+            "indexer_state": f"{prefix}.indexer.compressor.state_cache",
+        }
+        planes = {}
+        for name, key in plane_keys.items():
+            if key not in attn_metadata:
+                raise RuntimeError(f"xlite V4: DSA metadata key '{key}' not found in forward context")
+            planes[name] = attn_metadata[key]  # AscendDSAMetadata
+
+        swa_meta = planes["swa"]
+        swa_req = swa_meta.req_metadata
+        num_actual_tokens = int(swa_meta.num_actual_tokens)
+        seq_lens = torch.as_tensor(swa_req.seq_lens, device="cpu")
+        qsl = torch.as_tensor(swa_req.query_start_loc, device="cpu")  # [num_reqs+1], 0-prefixed
+        num_reqs = max(1, qsl.shape[0] - 1)
+        # query_start_loc is cumulative ([0, q0, q0+q1, ...]); diff yields per-req query lens.
+        query_lens = torch.diff(qsl)[:num_reqs]
+        cached_lens = torch.clamp(seq_lens[:num_reqs] - query_lens, min=0)
+
+        meta = AttnMetaV2()
+        meta.lens = query_lens.to(self.device, dtype=torch.int32)
+        meta.cached_lens = cached_lens.to(self.device, dtype=torch.int32)
+        meta.lens_cpu = query_lens.tolist()
+        meta.cached_lens_cpu = cached_lens.tolist()
+        # xlite query_start_loc is [num_reqs] (per-req query start, 0-prefixed) — drop the tail.
+        meta.query_start_loc = qsl[:num_reqs].to(self.device, dtype=torch.int32)
+        positions_flat = positions.reshape(-1)
+        meta.positions = positions_flat[:num_actual_tokens].to(self.device, dtype=torch.int64)
+
+        # slot_mapping per plane: idx0/idx3 (indexer_state, state) use per-token abs-pos; the
+        # write path derives each token's state slot from its absolute position. idx1/idx2
+        # (indexer_k, compress_kv) are per-block (computed per row below); idx4 (swa_kv) is
+        # vllm's per-token slot mapping.
+        positions = positions_flat[:num_actual_tokens].to(self.device, dtype=torch.int32)
+        sm_fallback = torch.zeros(num_actual_tokens, dtype=torch.int32, device=self.device)
+        # Flatten vllm's swa slot mapping: non-A5 hardware gives 2D [block_idx, block_offset]
+        # pairs; convert to the 1D physical slot (block_idx*bs + offset). Padding pairs
+        # (block_idx < 0) keep -1 so writes skip them. Absent slot mapping falls back to zeros.
+        _swa_bs_default = self._cxa_block_sizes[4]
+
+        def _flatten_swa_sm(rm):
+            sm = rm.slot_mapping
+            if sm is None:
+                return sm_fallback
+            if sm.ndim == 2:
+                swa_bs = int(getattr(rm, "storage_block_size", 0) or _swa_bs_default)
+                _bidx, _boff = sm[:, 0], sm[:, 1]
+                sm = torch.where(_bidx >= 0, _bidx * swa_bs + _boff, _bidx)
+            return sm.reshape(-1)[:num_actual_tokens]
+
+        # Per-layer block_tables/slot_mapping. vllm shares one template row per distinct
+        # ratio>0 (sourced from its first layer); ratio==0 layers each own their row (independent
+        # swa pools, trailing MTP phantom layer stays all-empty). Rows are references, so
+        # expanding to per-layer adds no allocation. The flat default (c4 layer's row) serves
+        # the non-per-layer path.
+        _suf = {
+            "indexer_state": ".indexer.compressor.state_cache",
+            "indexer": ".indexer.k_cache",
+            "compress": ".attn",
+            "state": ".compressor.state_cache",
+            "swa": ".swa_cache",
+        }
+        # plane order matches the CXA cache index: INDEXER_STATE=0, INDEXER_K=1,
+        # COMPRESS_KV=2, STATE=3, SWA_KV=4.
+        _order = ["indexer_state", "indexer", "compress", "state", "swa"]
+        _empty = torch.zeros(0, dtype=torch.int32, device=self.device)
+
+        _first_of_ratio = {}
+        for i, r in enumerate(compress_ratios):
+            _first_of_ratio.setdefault(r, i)
+
+        def _row(i):
+            """Layer i's 5-plane (block_table, slot_mapping) row. Planes absent from this ratio
+            (indexer planes on ratio==128, everything but swa on ratio==0) stay _empty."""
+            bt_row, sm_row = [], []
+            for pn in _order:
+                entry = attn_metadata.get(f"model.layers.{i}.self_attn{_suf[pn]}")
+                if entry is None or entry.req_metadata is None:
+                    bt_row.append(_empty)
+                    sm_row.append(_empty)
+                    continue
+                rm = entry.req_metadata
+                bt = rm.block_table
+                bt_row.append(bt if torch.is_tensor(bt) and bt.numel() else _empty)
+                if pn in ("indexer_state", "state"):
+                    sm_row.append(positions)
+                elif pn == "compress":
+                    # Per-block write slots of THIS row's ratio — numel must match the
+                    # derived positions count (nTotalBlocks).
+                    sm_row.append(
+                        self._compress_block_slot_mapping(
+                            bt_row[-1], compress_ratios[i], self._cxa_block_sizes[2], cached_lens, query_lens, num_reqs
+                        )
+                    )
+                elif pn == "swa":
+                    sm_row.append(_flatten_swa_sm(rm))
+                elif pn == "indexer":
+                    sm_row.append(
+                        self._compress_block_slot_mapping(
+                            bt_row[-1], 4, self._cxa_block_sizes[1], cached_lens, query_lens, num_reqs
+                        )
+                        if compress_ratios[i] == 4
+                        else _empty
+                    )
+            return bt_row, sm_row
+
+        # ratio>0 peers share one template row per ratio; ratio==0 layers carry their own row
+        # (independent pools, trailing MTP phantom all-empty).
+        _r0_rows = {i: _row(i) for i, r in enumerate(compress_ratios) if r == 0}
+        _tpl = {r: _row(i) for r, i in _first_of_ratio.items() if r > 0}
+        _expanded = [_r0_rows[i] if r == 0 else _tpl[r] for i, r in enumerate(compress_ratios)]
+        # Flat default = the c4 layer's row (c4 is the first ratio==4 layer, so
+        # the guard at the top of this function ensures _tpl[4] exists).
+        meta.block_tables, meta.slot_mapping = _tpl[4]
+        meta.block_tables_per_layer = [bt for bt, _ in _expanded]
+        meta.slot_mapping_per_layer = [sm for _, sm in _expanded]
+
+        return meta
+
+    def _compress_block_slot_mapping(
+        self,
+        block_table: torch.Tensor,
+        ratio: int,
+        block_size: int,
+        cached_lens: torch.Tensor,
+        query_lens: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Compute the per-block slot mapping of a compressed cache (compress_kv or indexer_k)
+        from that cache's block table.
+
+        For each request ``b``, the new compressed blocks are ``j = 0..n_blocks_b-1`` where
+        ``n_blocks_b = ((cl_b+q_b)//r) - (cl_b//r)``. Each block's physical slot is
+        ``block_table[b][(cl_b//r + j)//bs]*bs + (cl_b//r + j)%bs`` (bs = the cache's block
+        size). For compress_kv the total length must equal the derived positions count.
+        """
+        bt_cpu = torch.as_tensor(block_table, device="cpu", dtype=torch.int32)
+        slots: list[torch.Tensor] = []
+        for b in range(num_reqs):
+            cl = int(cached_lens[b].item())
+            q = int(query_lens[b].item())
+            n_blocks = ((cl + q) // ratio) - (cl // ratio)
+            if n_blocks <= 0:
+                continue
+            logical = cl // ratio + torch.arange(n_blocks, dtype=torch.int32)  # cl/r + j
+            blk_idx = logical // block_size
+            offset = logical % block_size
+            row = bt_cpu[b]
+            phys = row[blk_idx] * block_size + offset
+            slots.append(phys)
+        if not slots:
+            return torch.zeros(0, dtype=torch.int32, device=self.device)
+        return torch.cat(slots).to(self.device, dtype=torch.int32)
+
+
 class MiniMaxM2XliteModel(StandardXliteModel):
     """xlite adapter for MiniMax M2 architectures."""
 
@@ -850,6 +1359,29 @@ class XliteWrapper:
         curr_stream = torch.npu.current_stream()
         if self.npu_update_stream is not None and self.npu_update_stream != curr_stream:
             curr_stream.wait_stream(self.npu_update_stream)
+
+        # V4 CXA attention runs on the V2 device-tensor forward path (AttnMetaV2 + forward_v2);
+        # the V1 host-path (AttnMeta + forward) below does not apply. `attn_metadata` was
+        # clobbered to a single layer entry above, so re-fetch the full DSAMetadataDict here.
+        if getattr(self.adapter_xlite_model, "_uses_v2", False):
+            dsa_dict = forward_context.attn_metadata
+            if isinstance(dsa_dict, list):
+                dsa_dict = dsa_dict[0]
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            attn_meta_v2 = self.adapter_xlite_model._build_attn_meta_v2(dsa_dict, positions, num_tokens)
+            h = self.hidden_states[:num_tokens]
+            stream = torch.npu.current_stream().npu_stream
+            input_ids = cast(torch.Tensor, input_ids)
+            self.xlite_model.forward_v2(
+                rt=self.xlite_rt,
+                input=input_ids[:num_actual_tokens],
+                attn_meta=attn_meta_v2,
+                kv_cache=self.kv_caches,
+                freqs_cis=self.freq_cis,
+                output=h,
+                curr_stream=stream,
+            )
+            return h[:num_actual_tokens]
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
         num_actual_tokens = attn_metadata_router.num_actual_tokens

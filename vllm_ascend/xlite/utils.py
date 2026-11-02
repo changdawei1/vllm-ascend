@@ -29,6 +29,7 @@ from vllm.logger import logger
 from xlite._C import Model, ModelConfig
 
 from vllm_ascend.attention.attention_v1 import AscendMetadata
+from vllm_ascend.attention.dsa_v1 import AscendDSAMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
 
@@ -331,6 +332,9 @@ class AttnMetadataRouter:
         if isinstance(self.attn_metadata, (AscendMetadata, AscendMLAMetadata)):
             return torch.as_tensor(self.attn_metadata.query_start_loc, device=self.device)
 
+        if isinstance(self.attn_metadata, AscendDSAMetadata):
+            return torch.as_tensor(self.attn_metadata.req_metadata.query_start_loc, device=self.device)
+
         if isinstance(self.attn_metadata, AscendSFAMetadata):
             return torch.as_tensor(self.attn_metadata.cum_query_lens, device=self.device)
 
@@ -347,6 +351,9 @@ class AttnMetadataRouter:
         """Get the block tables from the attention metadata, if available."""
         if isinstance(self.attn_metadata, AscendMetadata):
             return torch.as_tensor(self.attn_metadata.block_tables, device=self.device)
+
+        if isinstance(self.attn_metadata, AscendDSAMetadata):
+            return torch.as_tensor(self.attn_metadata.req_metadata.block_table, device=self.device)
 
         if isinstance(self.attn_metadata, AscendSFAMetadata):
             return torch.as_tensor(self.attn_metadata.block_table, device=self.device)
@@ -374,6 +381,9 @@ class AttnMetadataRouter:
         """Return the per-sequence `seq_lens` tensor in a device-safe torch.Tensor form."""
         if isinstance(self.attn_metadata, (AscendMetadata, AscendSFAMetadata)):
             return torch.as_tensor(self.attn_metadata.seq_lens_cpu, device=self.device)
+
+        if isinstance(self.attn_metadata, AscendDSAMetadata):
+            return torch.as_tensor(self.attn_metadata.req_metadata.seq_lens, device=self.device)
 
         if isinstance(self.attn_metadata, AscendMLAMetadata):
             # AscendMLAMetadataBuilder.build_decode_metadata breaks `AscendMLAMetadata.seq_lens`
